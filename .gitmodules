@@ -1,0 +1,3 @@
+[submodule "DisPerSE"]
+	path = DisPerSE
+	url = git@github.com:FranUcles/DisPerSE.git
