@@ -7,9 +7,20 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
+#include <functional>
 using namespace std;
 
-const vector<string> required_fields_config = {"port", "shared_dir", "use_conda", "log_level", "workflow_file"};
+void exec_start(const string& input, const string& output);
+
+unordered_map<string, function<void(string, string)>> commands {
+    {"START", exec_start}
+};
+
+unordered_map<string, vector<string>> required_fields = {
+    {"CONFIG", {"port", "shared_dir", "use_conda", "log_level", "workflow_file"}},
+    {"START", {"input", "output"}}
+};
 
 const string ERROR_FLAG = "FAIL";
 
@@ -32,9 +43,21 @@ string LOG_FLAG = "";
 string WORKFLOW_FILE = "";
 string COMMAND_PREFIX = "";
 
-constexpr const char* command_template = "python {} {} -i {} -o {}";
+
+bool is_correct_format(nlohmann::json_abi_v3_11_3::json json, vector<string> required_fields, bool debug = true) {
+    bool correct_format = true;
+        for (const auto& field : required_fields) {
+            if (!json.contains(field)) {
+                if (debug)
+                    cerr << "En la JSON falta el campo obligatorio: " << field << endl;
+                correct_format = false;
+            }
+        }
+    return correct_format;
+}
 
 void exec_start(const string& input, const string& output) {
+    constexpr const char* command_template = "python {} {} -i {} -o {}";
     string command = COMMAND_PREFIX + format(command_template, WORKFLOW_FILE, LOG_FLAG, SHARED_DIR + input, SHARED_DIR + output); 
     int ret = system(command.c_str());
     if(ret != 0) {
@@ -42,7 +65,6 @@ void exec_start(const string& input, const string& output) {
     }
 }
 
-// --- función para leer exactamente N bytes (importante en sockets) ---
 ssize_t read_exact(int fd, void* buffer, size_t size) {
     size_t total = 0;
     uint8_t* ptr = reinterpret_cast<uint8_t*>(buffer);
@@ -55,31 +77,38 @@ ssize_t read_exact(int fd, void* buffer, size_t size) {
     return total;
 }
 
-// --- PARSER COMPLETO ---
+vector<char> read_payload(int fd, uint32_t payload_len){
+
+    // Leer todo el mensaje completo
+    vector<char> data(payload_len);
+    if (read_exact(fd, data.data(), payload_len) != (ssize_t)payload_len) {
+        cerr << "Error leyendo payload\n";
+        return {};
+    }
+    return data;
+}
+
 void handle_client_message(int fd) {
     uint32_t net_len;
 
-    // 1. Leer longitud (4 bytes)
+    // Leemos cuál es el tamaño del mensaje
     if (read_exact(fd, &net_len, sizeof(net_len)) != sizeof(net_len)) {
-        cerr << "Error leyendo longitud o cliente desconectado\n";
+        cerr << "Error leyendo longitud o cliente desconectado" << endl;
         return;
     }
 
-    // 2. Convertir de network byte order (big endian) a host
+    // Convertir de network byte order (big endian) a host
     uint32_t len = ntohl(net_len);
 
-    // Validaciones de seguridad
-    if (len == 0 || len > 1024) { // máximo 1MB
+    // Validamos que el mensaje no sea inmenso
+    if (len == 0 || len > 1024) { 
         cerr << "Longitud inválida: " << len << endl;
         return;
     }
 
-    // 3. Leer el payload completo
-    vector<char> data(len);
-    if (read_exact(fd, data.data(), len) != (ssize_t)len) {
-        cerr << "Error leyendo payload\n";
-        return;
-    }
+    // Leer todo el mensaje completo
+    vector<char> data = read_payload(fd, len);
+    if (data.empty()) return;
 
     try {
         nlohmann::json_abi_v3_11_3::json details = nlohmann::json_abi_v3_11_3::json::parse(data);
@@ -88,14 +117,13 @@ void handle_client_message(int fd) {
             return;
         }
         string cmd = details["cmd"];
-        if (cmd == "START"){
-            if (!details.contains("input") || !details.contains("output")){
-                cerr << "Parámetros del comando START erróneos: " << details.dump(4) << endl;
+        if (commands.find(cmd) != commands.end()){
+            if (!is_correct_format(details, required_fields[cmd])){
+                cerr << "Parámetros del comando " << cmd << " erróneos: " << details.dump(4) << endl;
                 return;
             }
-            string input = details["input"];
-            string output = details["output"];
-            exec_start(input, output);
+            commands[cmd](details["input"], details["output"]);
+            
         } else {
             cerr << "Comando desconocido: " << cmd << endl;
             return;
@@ -118,18 +146,12 @@ string read_file(const string& path) {
     return buffer.str();    // Convierte a string
 }
 
-
 void set_config(const string& config_file){
-    try{
+    try {
+        // Parseamos la configuración
         nlohmann::json_abi_v3_11_3::json config = nlohmann::json_abi_v3_11_3::json::parse(read_file(config_file));
-        bool correct_format = true;
-        for (const auto& field : required_fields_config) {
-            if (!config.contains(field)) {
-                cerr << "En la configuración falta el campo obligatorio: " << field << endl;
-                correct_format = false;
-            }
-        }
-        if (!correct_format) exit(EXIT_FAILURE);
+        if (!is_correct_format(config, required_fields["CONFIG"])) exit(EXIT_FAILURE);
+        // Guardamos la configuración en sus respectivas variables
         PORT = config["port"];
         SHARED_DIR = config["shared_dir"];
         LOG_FLAG = get_log_flag(config["log_level"]);
@@ -155,16 +177,8 @@ void set_config(const string& config_file){
     }
 }
 
-int main(int argc, char *argv[]) {
-    if (argc < 2){
-        cerr << "Falta el fichero de configuración" << endl;
-        exit(EXIT_FAILURE);
-    }
-    string config_file = argv[1];
-    set_config(config_file);
-    int server_fd, client_fd;
-    struct sockaddr_in address;
-    int addrlen = sizeof(address);
+int init_socket(struct sockaddr_in &address){
+    int server_fd;
 
     // 1. Crear socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
@@ -174,11 +188,11 @@ int main(int argc, char *argv[]) {
 
     // 2. Configurar dirección
     address.sin_family = AF_INET;
-    if (LISTEN_ADDR == "0")
-        address.sin_addr.s_addr = INADDR_ANY; // acepta conexiones de cualquier IP
+    if (LISTEN_ADDR == "0") // acepta conexiones de cualquier IP
+        address.sin_addr.s_addr = INADDR_ANY; 
     else{
-        if(inet_pton(AF_INET, LISTEN_ADDR.c_str(), &address.sin_addr) <= 0){
-            cerr << "IP inválida" << endl;
+        if(inet_pton(AF_INET, LISTEN_ADDR.c_str(), &address.sin_addr) < 0){
+            perror("inet_pton failed");
             exit(EXIT_FAILURE);
         }
     }
@@ -195,20 +209,37 @@ int main(int argc, char *argv[]) {
         perror("listen failed");
         exit(EXIT_FAILURE);
     }
+    return server_fd;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2){
+        cerr << "Falta el fichero de configuración" << endl;
+        exit(EXIT_FAILURE);
+    }
+    // Establecemos la configuración
+    string config_file = argv[1];
+    set_config(config_file);
+
+    // Inicializamos el socket
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+    int server_fd = init_socket(address);
+    int client_fd;
 
     printf("Servidor escuchando en el puerto %d...\n", PORT);
 
     while (1) {
-        // 5. Accept
+        // Aceptamos la conexión
         if ((client_fd = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
             perror("accept failed");
             exit(EXIT_FAILURE);
         }
 
-        // 6. Leer mensaje
+        // Manejamos el mensaje del usuario
         handle_client_message(client_fd);
 
-        // 8. Cerrar conexión con este cliente
+        // Cerramos la conexión con ese cliente
         close(client_fd);
     }
 
