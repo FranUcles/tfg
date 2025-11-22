@@ -4,14 +4,17 @@ import coloredlogs
 import argparse
 import subprocess
 import tempfile
+import os
 
 logger = logging.getLogger(__name__)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Dict struct: "step_name": "command_details"
 # Each "command_details" is a duple containing: (python env, [command, arguments...])
 
 STEPS = {
-    "parse_umap": ("tfg_visuals", ["python", "tools/ndfield_parser.py"]),
+    "parse_umap": ("tfg_visuals", ["python", BASE_DIR + "/tools/ndfield_parser.py"]),
     "delaunay": ("disperse", ["delaunay_3D"])
 }
 
