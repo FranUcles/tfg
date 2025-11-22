@@ -9,6 +9,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <functional>
+#include "ThreadPool.hpp"
 using namespace std;
 
 void exec_start(const string& input, const string& output);
@@ -229,18 +230,22 @@ int main(int argc, char *argv[]) {
 
     printf("Servidor escuchando en el puerto %d...\n", PORT);
 
+    // Creamos el pool de hilos que gestionarán las peticiones de los clientes
+    ThreadPool threads_pool(5);
+
     while (1) {
         // Aceptamos la conexión
         if ((client_fd = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
             perror("accept failed");
-            exit(EXIT_FAILURE);
+            continue;
         }
 
-        // Manejamos el mensaje del usuario
-        handle_client_message(client_fd);
-
-        // Cerramos la conexión con ese cliente
-        close(client_fd);
+        // Encolamos el manejo de esta petición para el pool de hilos
+        // y seguimos procesando peticiones
+        threads_pool.enqueue([client_fd]() {
+            handle_client_message(client_fd);
+            close(client_fd);
+        });
     }
 
     return 0;
