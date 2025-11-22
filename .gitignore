@@ -1,0 +1,3 @@
+*.tumap
+*.vtp
+__pycache__/*

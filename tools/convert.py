@@ -1,7 +1,8 @@
-#!/usr/bin/python3
 import logging
+import coloredlogs
 import vtk
 import argparse
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -68,24 +69,35 @@ def configure_logging(args):
     else:
         level = logging.INFO
 
-    logging.basicConfig(
+    coloredlogs.install(
         level=level,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+        logger=logger,
+        fmt='%(asctime)s [%(levelname)s] : %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
     )
 
 def read_points_from_file(fname):
-    # TODO Read the cloud point
-    pass
+    logger.info(f"Reading {fname}...")
+    try:
+        df = pd.read_pickle(fname)
+        columns_umap = ['umap_0', 'umap_1', 'umap_2']
+        matrix = df[columns_umap].to_numpy()
+        logger.info("File read succesfully!")
+        return matrix
+    except FileNotFoundError:
+        logger.error(f"File {fname} not found")
+        exit(1)
+    except Exception as e:
+        logger.error(f"Error while reading {fname}: {e}")
+        exit(1)
 
 def main():
     args = parse_args()
     configure_logging(args)
 
-    logger.info("Starting cloud point processing...")
-
     cmass = read_points_from_file(args.input)
 
-    if not cmass:
+    if not cmass.any():
         logger.error("No points to process. Exiting.")
         return
 
