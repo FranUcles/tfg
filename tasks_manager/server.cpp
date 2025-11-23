@@ -2,7 +2,7 @@
 #include <vector>
 #include <string>
 #include <iostream>
-#include <format>
+#include <sstream>
 #include <arpa/inet.h>
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -72,7 +72,9 @@ bool is_correct_format(nlohmann::json_abi_v3_11_3::json json, vector<string> req
 
 void exec_start(const string& input, const string& output) {
     constexpr const char* command_template = "python {} {} -i {} -o {}";
-    string command = COMMAND_PREFIX + format(command_template, WORKFLOW_FILE, LOG_FLAG, SHARED_DIR + input, SHARED_DIR + output); 
+    ostringstream oss;
+    oss << "python " << WORKFLOW_FILE << " " << LOG_FLAG << " -i " << SHARED_DIR + input << " -o " << SHARED_DIR + output;
+    string command = COMMAND_PREFIX + oss.str(); 
     int ret = system(command.c_str());
     if(ret != 0) {
         cerr << "Error ejecutando el comando" << endl;
@@ -180,7 +182,9 @@ void set_config(const string& config_file){
                 cerr << "No se ha especificado un entorno de conda" << endl;
                 exit(EXIT_FAILURE);
             }
-            COMMAND_PREFIX = format("mamba run -n {} ", (string)config["conda_env"]);
+            ostringstream oss;
+            oss << "mamba run -n " << (string)config["conda_env"] << " ";
+            COMMAND_PREFIX = oss.str();
         }
         // Verificamos ahora que la configuración de la conexión sea correcta
         nlohmann::json_abi_v3_11_3::json connection = config["connection"];
