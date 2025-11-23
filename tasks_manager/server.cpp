@@ -9,6 +9,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <functional>
+#include <sys/un.h>
 #include "ThreadPool.hpp"
 using namespace std;
 
@@ -19,9 +20,19 @@ unordered_map<string, function<void(string, string)>> commands {
 };
 
 unordered_map<string, vector<string>> required_fields = {
-    {"CONFIG", {"port", "shared_dir", "use_conda", "log_level", "workflow_file"}},
+    {"CONFIG", {"shared_dir", "use_conda", "log_level", "workflow_file", "connection"}},
+    {"TCP", {"port"}},
+    {"UNIX", {"socket_path"}},
     {"START", {"input", "output"}}
 };
+
+const string REQUEST_OK = R"({
+        "result": "OK"
+    })";
+
+const string REQUEST_FAILURE = R"({
+        "result": "FAIL"
+    })";
 
 const string ERROR_FLAG = "FAIL";
 
@@ -43,6 +54,8 @@ string LISTEN_ADDR = "0";
 string LOG_FLAG = "";
 string WORKFLOW_FILE = "";
 string COMMAND_PREFIX = "";
+string SERVER_MODE = "";
+string UNIX_PATH = "";
 
 
 bool is_correct_format(nlohmann::json_abi_v3_11_3::json json, vector<string> required_fields, bool debug = true) {
@@ -89,13 +102,13 @@ vector<char> read_payload(int fd, uint32_t payload_len){
     return data;
 }
 
-void handle_client_message(int fd) {
+int64_t handle_client_message(int fd) {
     uint32_t net_len;
 
     // Leemos cuál es el tamaño del mensaje
     if (read_exact(fd, &net_len, sizeof(net_len)) != sizeof(net_len)) {
         cerr << "Error leyendo longitud o cliente desconectado" << endl;
-        return;
+        return 1;
     }
 
     // Convertir de network byte order (big endian) a host
@@ -104,34 +117,36 @@ void handle_client_message(int fd) {
     // Validamos que el mensaje no sea inmenso
     if (len == 0 || len > 1024) { 
         cerr << "Longitud inválida: " << len << endl;
-        return;
+        return 1;
     }
 
     // Leer todo el mensaje completo
     vector<char> data = read_payload(fd, len);
-    if (data.empty()) return;
+    if (data.empty()) return 1;
 
     try {
         nlohmann::json_abi_v3_11_3::json details = nlohmann::json_abi_v3_11_3::json::parse(data);
         if (!details.contains("cmd")){
             cerr << "JSON mal formateado: " << details.dump(4) << endl;
-            return;
+            return 1;
         }
         string cmd = details["cmd"];
         if (commands.find(cmd) != commands.end()){
             if (!is_correct_format(details, required_fields[cmd])){
                 cerr << "Parámetros del comando " << cmd << " erróneos: " << details.dump(4) << endl;
-                return;
+                return 1;
             }
             commands[cmd](details["input"], details["output"]);
             
         } else {
             cerr << "Comando desconocido: " << cmd << endl;
-            return;
+            return 1;
         }
     } catch (const nlohmann::json_abi_v3_11_3::json::parse_error& e) {
         cerr << "Error parseando JSON: " << e.what() << endl;
+        return 1;
     }
+    return 0;
 }
 
 string read_file(const string& path) {
@@ -153,7 +168,6 @@ void set_config(const string& config_file){
         nlohmann::json_abi_v3_11_3::json config = nlohmann::json_abi_v3_11_3::json::parse(read_file(config_file));
         if (!is_correct_format(config, required_fields["CONFIG"])) exit(EXIT_FAILURE);
         // Guardamos la configuración en sus respectivas variables
-        PORT = config["port"];
         SHARED_DIR = config["shared_dir"];
         LOG_FLAG = get_log_flag(config["log_level"]);
         WORKFLOW_FILE = config["workflow_file"];
@@ -168,19 +182,30 @@ void set_config(const string& config_file){
             }
             COMMAND_PREFIX = format("mamba run -n {} ", (string)config["conda_env"]);
         }
-
-        if (config.contains("listen_addr"))
-            LISTEN_ADDR = config["listen_addr"];
-
+        // Verificamos ahora que la configuración de la conexión sea correcta
+        nlohmann::json_abi_v3_11_3::json connection = config["connection"];
+        if (!connection.contains("mode")){
+            cerr << "Falta el modo de la conexión" << endl;
+            exit(EXIT_FAILURE);
+        }
+        SERVER_MODE = connection["mode"];
+        // Comprobamos que la conexión tiene todos los campos obligatorios según el tipo
+        if (!is_correct_format(connection, required_fields[SERVER_MODE])) exit(EXIT_FAILURE);
+        if (SERVER_MODE == "TCP"){
+            PORT = connection["port"];
+            if (connection.contains("listen_addr"))
+                LISTEN_ADDR = connection["listen_addr"];
+        } else if (SERVER_MODE == "UNIX"){
+            UNIX_PATH = connection["socket_path"];
+        }
     } catch (const nlohmann::json_abi_v3_11_3::json::parse_error& e) {
         cerr << "Error al leer la configuración: " << e.what() << endl;
         exit(EXIT_FAILURE);
     }
 }
 
-int init_socket(struct sockaddr_in &address){
+int init_tcp_socket(struct sockaddr_in &address){
     int server_fd;
-
     // 1. Crear socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         perror("socket failed");
@@ -213,6 +238,49 @@ int init_socket(struct sockaddr_in &address){
     return server_fd;
 }
 
+int init_unix_socket(struct sockaddr_un &address){
+    int server_fd;
+    const char *path = UNIX_PATH.c_str();
+    // 1. Crear socket
+    unlink(path);  // limpiar socket previo si existe
+    if ((server_fd = socket(AF_UNIX, SOCK_STREAM, 0)) == 0){
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // 2. Configurar dirección
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, path);
+
+    // 3. Bind
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
+    // 4. Listen
+    if (listen(server_fd, 5) < 0) {
+        perror("listen failed");
+        exit(EXIT_FAILURE);
+    }
+    return server_fd;
+}
+
+inline int init_socket(struct sockaddr_storage &address){
+    if (SERVER_MODE == "TCP")
+        return init_tcp_socket(*reinterpret_cast<struct sockaddr_in*>(&address));
+    if (SERVER_MODE == "UNIX")
+        return init_unix_socket(*reinterpret_cast<struct sockaddr_un*>(&address));
+    cerr << "Modo de uso desconocido" << endl;
+    exit(EXIT_FAILURE);
+}
+
+void send_response(int request_result, int client_fd){
+    const string response = request_result == 0 ? REQUEST_OK : REQUEST_FAILURE;
+    write(client_fd, response.c_str(), response.size());
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2){
         cerr << "Falta el fichero de configuración" << endl;
@@ -222,16 +290,14 @@ int main(int argc, char *argv[]) {
     string config_file = argv[1];
     set_config(config_file);
 
+    // Creamos el pool de hilos que gestionarán las peticiones de los clientes
+    ThreadPool threads_pool(5);
+
     // Inicializamos el socket
-    struct sockaddr_in address;
+    struct sockaddr_storage address;
     int addrlen = sizeof(address);
     int server_fd = init_socket(address);
     int client_fd;
-
-    printf("Servidor escuchando en el puerto %d...\n", PORT);
-
-    // Creamos el pool de hilos que gestionarán las peticiones de los clientes
-    ThreadPool threads_pool(5);
 
     while (1) {
         // Aceptamos la conexión
@@ -239,14 +305,13 @@ int main(int argc, char *argv[]) {
             perror("accept failed");
             continue;
         }
-
         // Encolamos el manejo de esta petición para el pool de hilos
         // y seguimos procesando peticiones
         threads_pool.enqueue([client_fd]() {
-            handle_client_message(client_fd);
+            int result = handle_client_message(client_fd);
+            send_response(result, client_fd);
             close(client_fd);
         });
     }
-
     return 0;
 }

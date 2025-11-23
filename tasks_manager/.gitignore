@@ -1,2 +1,4 @@
 server
-config.json
+*.json
+*.logs
+*.sock
