@@ -12,6 +12,7 @@
 #include <sys/un.h>
 #include "ThreadPool.hpp"
 using namespace std;
+using namespace nlohmann;
 
 void exec_start(const string& input, const string& output);
 
@@ -58,7 +59,7 @@ string SERVER_MODE = "";
 string UNIX_PATH = "";
 
 
-bool is_correct_format(nlohmann::json_abi_v3_11_3::json json, vector<string> required_fields, bool debug = true) {
+bool is_correct_format(json json, vector<string> required_fields, bool debug = true) {
     bool correct_format = true;
         for (const auto& field : required_fields) {
             if (!json.contains(field)) {
@@ -127,7 +128,7 @@ int64_t handle_client_message(int fd) {
     if (data.empty()) return 1;
 
     try {
-        nlohmann::json_abi_v3_11_3::json details = nlohmann::json_abi_v3_11_3::json::parse(data);
+        json details = json::parse(data);
         if (!details.contains("cmd")){
             cerr << "JSON mal formateado: " << details.dump(4) << endl;
             return 1;
@@ -144,7 +145,7 @@ int64_t handle_client_message(int fd) {
             cerr << "Comando desconocido: " << cmd << endl;
             return 1;
         }
-    } catch (const nlohmann::json_abi_v3_11_3::json::parse_error& e) {
+    } catch (const json::parse_error& e) {
         cerr << "Error parseando JSON: " << e.what() << endl;
         return 1;
     }
@@ -167,7 +168,7 @@ string read_file(const string& path) {
 void set_config(const string& config_file){
     try {
         // Parseamos la configuración
-        nlohmann::json_abi_v3_11_3::json config = nlohmann::json_abi_v3_11_3::json::parse(read_file(config_file));
+        json config = json::parse(read_file(config_file));
         if (!is_correct_format(config, required_fields["CONFIG"])) exit(EXIT_FAILURE);
         // Guardamos la configuración en sus respectivas variables
         SHARED_DIR = config["shared_dir"];
@@ -187,7 +188,7 @@ void set_config(const string& config_file){
             COMMAND_PREFIX = oss.str();
         }
         // Verificamos ahora que la configuración de la conexión sea correcta
-        nlohmann::json_abi_v3_11_3::json connection = config["connection"];
+        json connection = config["connection"];
         if (!connection.contains("mode")){
             cerr << "Falta el modo de la conexión" << endl;
             exit(EXIT_FAILURE);
@@ -202,7 +203,7 @@ void set_config(const string& config_file){
         } else if (SERVER_MODE == "UNIX"){
             UNIX_PATH = connection["socket_path"];
         }
-    } catch (const nlohmann::json_abi_v3_11_3::json::parse_error& e) {
+    } catch (const json::parse_error& e) {
         cerr << "Error al leer la configuración: " << e.what() << endl;
         exit(EXIT_FAILURE);
     }
@@ -239,6 +240,7 @@ int init_tcp_socket(struct sockaddr_in &address){
         perror("listen failed");
         exit(EXIT_FAILURE);
     }
+    cout << "Escuchando en el puerto " << PORT << endl;
     return server_fd;
 }
 
@@ -268,6 +270,7 @@ int init_unix_socket(struct sockaddr_un &address){
         perror("listen failed");
         exit(EXIT_FAILURE);
     }
+    cout << "Escuchando en el socket " << UNIX_PATH << endl;
     return server_fd;
 }
 
